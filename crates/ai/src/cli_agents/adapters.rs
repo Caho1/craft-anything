@@ -15,6 +15,7 @@ mod hermes;
 mod kimi_code;
 mod maki;
 mod opencode;
+mod pi;
 pub use aider::Aider;
 pub use antigravity::Antigravity;
 pub use copilot::Copilot;
@@ -25,6 +26,7 @@ pub use hermes::Hermes;
 pub use kimi_code::KimiCode;
 pub use maki::Maki;
 pub use opencode::OpenCode;
+pub use pi::PiCli;
 
 /// What a run's arguments are built from.
 pub struct ArgsCx<'a> {
@@ -342,6 +344,7 @@ impl AgentAdapters {
                 Arc::new(DeepSeekHarness),
                 Arc::new(Devin),
                 Arc::new(KimiCode),
+                Arc::new(PiCli),
             ],
         }
     }
