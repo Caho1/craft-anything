@@ -232,6 +232,8 @@ fn classify(why: &str) -> FailureKind {
         FailureKind::Billing
     } else if why.contains("429") || why.contains("rate limit") || why.contains("too many requests") {
         FailureKind::RateLimited
+    } else if why.contains("usage limit") || why.contains("plan limit") || why.contains("5-hour limit") || why.contains("weekly limit") {
+        FailureKind::UsageLimit
     } else if why.contains("timeout") || why.contains("timed out") || why.contains("overload") || why.contains("529") || why.contains("503") {
         FailureKind::Transient
     } else {
@@ -245,6 +247,9 @@ fn remediation(kind: FailureKind) -> &'static str {
         FailureKind::Authentication => "Sign in to the provider pi uses: run `pi` once in a terminal, sign in, then start the build again.",
         FailureKind::Billing => "Check the account's plan, credits and spending limit in the provider pi uses, then start the build again.",
         FailureKind::RateLimited => "Wait a minute, or choose another model in Settings, then start the build again.",
+        FailureKind::UsageLimit => {
+            "This plan's allowance is used up for now: it comes back in hours, not minutes. Wait for the reset time the provider names, or choose another model in Settings, then start the build again."
+        }
         FailureKind::Transient => "This looks temporary: the build's next attempt may get through. If it keeps happening, choose another model in Settings.",
         FailureKind::MissingProgram | FailureKind::ToolsUnavailable | FailureKind::Configuration | FailureKind::Unknown => {
             "Run `pi` once in this project's folder to see the same answer without Craft Anything, then start the build again."
@@ -611,6 +616,7 @@ mod tests {
         assert_eq!(p.failure.map(|f| f.kind), Some(FailureKind::Authentication));
         for (why, kind) in [
             ("429 Too Many Requests", FailureKind::RateLimited),
+            ("Claude usage limit reached. It resets at 3pm", FailureKind::UsageLimit),
             ("insufficient credit", FailureKind::Billing),
             ("upstream timed out", FailureKind::Transient),
             ("the model said no", FailureKind::Unknown),

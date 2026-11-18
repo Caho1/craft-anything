@@ -97,6 +97,10 @@ const DECLARED: &[Declared] = &[
         approvals: Given::NotYet("its headless profile asks nothing of the host, and no run has checked whether an approval request reaches us"),
         mid_turn_notes: Given::No,
     },
+    // Our server rides a one-function extension the run loads with `-e`, since pi takes no
+    // tool-server flag; the same extension's `tool_call` handler asks `core_action_approve` about
+    // pi's own `bash`, `powershell`, `write` and `edit`.
+    Declared { id: "pi", path: Path::Argv, tool_server: Given::Yes, approvals: Given::Yes, mid_turn_notes: Given::No },
     // Any other CLI: the prompt as its last argument, its output streamed as text.
     Declared {
         id: "plain",
@@ -224,6 +228,13 @@ mod tests {
         }
     }
 
+    /// Whether the run names our approval tool, in an argument or in a file an argument names:
+    /// pi's extension holds the bridge and calls the CLI's `core-action-approve`.
+    fn names_approval(argv: &[String]) -> bool {
+        let names = |text: &str| text.contains(APPROVAL_TOOL) || text.contains(&APPROVAL_TOOL.replace('_', "-"));
+        argv.iter().any(|a| names(a)) || argv.iter().any(|a| std::fs::read_to_string(a).is_ok_and(|text| names(&text)))
+    }
+
     #[test]
     fn declared_notes_and_approvals_match_the_arguments() {
         for a in adapters() {
@@ -240,7 +251,7 @@ mod tests {
                 if notes { "carry" } else { "don't carry" }
             );
             if g.approvals.given() {
-                let asks = argv.iter().any(|w| w.contains(APPROVAL_TOOL)) || row.path == Path::Acp;
+                let asks = names_approval(&argv) || row.path == Path::Acp;
                 assert!(asks, "{}: an approval channel is declared, but its run has none", row.id);
             }
         }
