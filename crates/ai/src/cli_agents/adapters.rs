@@ -197,6 +197,12 @@ pub trait AgentAdapter: Send + Sync {
     fn resumes(&self) -> bool {
         false
     }
+    /// A question can be answered from a fork of the builder's saved session, leaving the
+    /// builder's own conversation unchanged. When false, a question starts fresh even though the
+    /// adapter can [resume](AgentAdapter::resumes) a build.
+    fn questions_fork_session(&self) -> bool {
+        true
+    }
     /// It honours [`ArgsCx::question`]: it can be held to reading only, using a fresh session
     /// or leaving a resumed session unchanged. Questions go only to adapters that say so.
     fn answers_questions(&self) -> bool {
@@ -229,6 +235,10 @@ pub trait AgentAdapter: Send + Sync {
     fn process(&self, program: &str) -> Process {
         Process::new(program)
     }
+    /// Remove what [`args`](AgentAdapter::args) wrote for one turn (an extension file, for one),
+    /// once the turn's process is over, however it ended: finished, stopped, timed out or failed
+    /// before it started. Called for every run whose arguments were built.
+    fn clean_up_after_turn(&self, _args: &[String]) {}
     /// Whether it still names an account it was signed in to, so a sign-in that doesn't work any
     /// more has expired (or was signed out) rather than never happened.
     fn signed_in_before(&self) -> bool {

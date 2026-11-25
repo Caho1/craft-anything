@@ -32,11 +32,27 @@ thinking depth goes in through `--thinking` when one is chosen.
 - One message per turn: `pi -p --mode json` with the message on stdin (never in argv, so a long
   brief stays clear of Windows' command-line limit). Its JSONL events are read line by line: the
   session header's id, `message_update` text deltas, both ends of every tool call, each assistant
-  message's usage, and a retry that gave up as an error in plain words.
+  message's usage, and a retry that gave up as an error in plain words. Checked against pi 1.6.0
+  (2026-11-25); 1.5.0 read the same records.
 - The conversation continues with `--session-id`, which pi creates on the first turn and resumes
-  afterwards. The projects' saved session (`craft.json`) is a pi session like any other agent's.
-- A question about a build starts a fresh pi session with reading tools only (or none in Clean
-  room), so it leaves the builder's conversation untouched.
+  afterwards; it is pi's project-local "this conversation, or a new one with this id". `--session`
+  is pi's global lookup by path or id and can reach another folder's conversation, so it isn't used.
+- Nothing of the person's or the project's loads beside the run: `--no-extensions` (a user's
+  extensions and one a builder wrote into the project), `--no-context-files` (`AGENTS.md`,
+  `CLAUDE.md`), and `--no-approve` (trust-gated project files even where a trust decision was saved).
+  `--no-extensions` turns off pi's built-in extensions too, MCP support among them since 0.99, so
+  `-e builtin:mcp` loads that one back by name — without it `registerMcpServer` fails and the build
+  has no Craft Anything tools.
+- A question about a build starts a fresh session with reading tools only (or none in Clean room),
+  as `--no-session --no-mcp`: it leaves the builder's conversation and pi's session list untouched,
+  and connects no server of anyone's. Its answer is therefore never marked as coming from the
+  builder's session.
+- A backend's saved extra arguments can't change any of that: a `--tools`, `--extension`, `--mode`,
+  `--session`/`--session-id`, `--session-dir`, `--no-mcp` or `--approve`/`--no-approve` there is
+  dropped before the run's own arguments, and so is anything after a bare `--` (pi would read it as
+  the message). Other saved arguments, such as `--model` or `--offline`, are kept.
+- A run over SSH is refused before it starts: the extension file is written on this computer, so a
+  pi on the host would be handed a path it can't see. It says so in plain words instead.
 
 ## The tool server
 
@@ -53,7 +69,8 @@ export default function (pi) {
 - The file is written into a folder of the run's own under the system temporary folder,
   owner-only on Unix (`0700` folder, `0600` file), so nothing another user could prepare in a
   shared temporary folder is ever loaded through it. A folder that can't take it stops the build
-  before it starts, with a fix.
+  before it starts, with a fix. The folder is removed when the turn ends, however it ends
+  (finished, stopped, timed out or failed first), so a build leaves nothing behind.
 - The server is named `craft-anything-run`, not `craft-anything`: pi refuses two clients with one
   name, and a `mcp.json` entry wins over an extension's, so a person's own registration is never
   replaced or reached. Its tools appear as `mcp__craft_anything_run__<tool>`, and Craft Anything
@@ -78,17 +95,25 @@ export default function (pi) {
 
 `codemode` and `tool_search` are left out on purpose: `codemode` calls a server's tools by name
 whatever the active tool set says, so leaving it in would reach the servers this run isn't meant
-to use (a person's other `mcp.json` servers still connect, and only stay out of reach because
-nothing here can name their tools).
+to use. No other server connects: a question passes `--no-mcp`, and a build's `--tools` names
+`mcp__craft_anything_run__*`, which filters MCP tools down to ours, so a person's own `mcp.json`
+servers are neither declared nor reachable.
 
 ## Approvals
 
 pi has no `--permission-prompt-tool`, so the same generated extension carries the bridge itself:
 its `tool_call` handler maps pi's changing tools (`bash`, `powershell`, `write`, `edit`) into
 Claude Code's shape (`Bash {command}`, `Write {file_path, content}`, `Edit {file_path, …}`) and runs
-`craft-anything-cli core-action-approve` with this run's project and mode. `allow` lets the call
-go on; `deny` blocks it and hands the policy's own words back to the model, so it knows what to do
-instead. Reads and ours tools pass straight through — ours carry their own consent.
+`craft-anything-cli core-action-approve` with this run's project and mode. The action's input goes
+in on stdin (`--json -`), not on the command line: a written file's content can be far past the
+point where Windows refuses to start a program, so a large write would otherwise be refused.
+`allow` lets the call go on; `deny` blocks it and hands the policy's own words back to the model,
+so it knows what to do instead. Reads and our tools pass straight through — ours carry their own
+consent.
+
+The call has a deadline of 35 minutes, a little past the approval policy's own 30-minute wait for
+the person. Running out kills the call and blocks the action with the error in words, so a stuck
+CLI can neither hang the builder nor let the action through.
 
 Nothing is installed into pi's own configuration: the bridge lives in the per-run extension file
 described above and is deleted with it. A run that cannot write that file stops before it starts.
@@ -109,5 +134,15 @@ described above and is deleted with it. A run that cannot write that file stops 
 - The approval bridge, in a Deep build: five `bash` calls and two `write` calls ran after the policy
   allowed them (`cargo --version` reached the page's footer as its exact output), and one action the
   policy refused ("Run a scripted web session") was blocked and reported to the builder.
-- Not verified: a Clean room build, a build over SSH, a model chosen in Settings, and pi versions
-  other than 1.5.0.
+- Not verified: a Clean room build end to end (its tool list is unit-tested only), a model chosen
+  in Settings, and pi versions other than 1.5.0 and 1.6.0.
+- Checked on pi 1.6.0 (2026-11-25, macOS): the generated extension loads and its tool is declared
+  (`mcp__craft_anything_run__*`), `--no-extensions -e builtin:mcp` keeps the person's and the
+  project's extensions and `AGENTS.md` out while our server still connects, `--tools` with an
+  `mcp__` entry filters other servers' tools out, `--session-id` creates and resumes in pi's usual
+  folder, and `-p` reads the message from stdin. The approval call took a 300,000-character input on
+  stdin, refused a malformed payload, and its deadline blocked a CLI that never answered. A
+  provider's error code `14018` is read as the used-up plan it is, not as a `401` bad key (a
+  status code counts only as its own number).
+- A first live run on 1.5.0 left a folder in the temporary folder after every turn; the run's
+  folder is now removed when the turn ends.

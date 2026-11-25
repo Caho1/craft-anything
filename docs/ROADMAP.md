@@ -1234,10 +1234,19 @@ Owner: open · Status: in progress
       and is put back in the folder pi names (the linked `/tmp` resolved first). See [Pi](pi.md).
       Four live builds on macOS reached Ready (one Deep with the bridge); one carried to another
       folder continued from the restored session.
+      Review fixes: the run's extension folder is removed however its turn ends; the approval
+      input goes in on stdin and the call has a deadline (a large write's content could stop
+      Windows starting the CLI); no other extension, context file or trust-gated project file
+      loads, and `-e builtin:mcp` is loaded back because `--no-extensions` turns it off too; SSH
+      is refused with the reason; a question is `--no-session --no-mcp` and is never marked as the
+      builder's session; the grants row says Clean room was not run live. Checked against pi
+      1.6.0: `--thinking` takes `off` where Craft Anything says `none`, and `--session-id` is the
+      project-local conversation (`--session` looks it up across folders).
 
 - [ ] Live-check a Clean room Pi build (the tool list and the approval bridge are unit-tested,
       and a Deep build was run live)
-- [ ] Pi over SSH: a builder there needs our tool server written on the host, as OpenCode's does
+- [ ] Pi over SSH: refused today, because the extension is written on this computer; a remote
+      builder needs our tool server written on the host, as OpenCode's does
 - [ ] Pi's model list in Settings (its `--list-models` prints a table) and a sign-in check
       (`pi auth check` needs a provider or model the adapter isn't given)
 - [x] Grok Build as a coding agent over ACP (`grok agent stdio`): discovery in `~/.grok/bin`,

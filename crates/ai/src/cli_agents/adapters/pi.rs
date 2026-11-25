@@ -3,14 +3,25 @@
 //! `pi -p --mode json` runs without the terminal UI and writes one JSON object per line: a session
 //! header, `message_update` deltas carrying the text, `tool_execution_start`/`tool_execution_end`
 //! for each call, `message_end` with the turn's usage, and `agent_settled` at the end. The session
-//! header's `id` continues the same conversation with `--session-id`, creating it the first time.
+//! header's `id` continues the same conversation with `--session-id`, creating it the first time
+//! and resuming the project's own copy afterwards (`--session` is pi's global lookup by path or id,
+//! which can reach another folder's conversation, so it isn't used here). Checked against pi 1.6.0
+//! (2026-11-25); 1.5.0 read the same records.
 //!
 //! pi has no flag for a tool server the way other agents do: servers come from a project's
 //! `mcp.json` (which needs the project trusted) and from extensions. Our tool server therefore
 //! arrives as a one-function extension this run loads with `-e`, registering it with
 //! `exposure: "direct"` so its tools are declared to the model instead of being kept behind
-//! `codemode`. The file is written into a folder of the run's own, owner-only on Unix, so nothing
-//! another user could prepare in a shared temporary folder is ever loaded through.
+//! `codemode`. The file is written into a folder of the run's own, owner-only on Unix, and removed
+//! when the turn ends, so nothing another user could prepare in a shared temporary folder is ever
+//! loaded through and nothing is left behind.
+//!
+//! `--no-extensions` keeps a person's and a project's own extensions from loading beside ours (one
+//! could otherwise shield pi's changing tools from the bridge). It also turns off pi's built-in
+//! extensions, MCP support among them since 0.99, so that one is loaded back by name
+//! (`-e builtin:mcp`) or `registerMcpServer` fails. `--no-context-files` keeps AGENTS.md and
+//! CLAUDE.md out, and `--no-approve` keeps trust-gated project files out even where a trust
+//! decision was saved.
 //!
 //! `--tools` with an `mcp__` entry filters MCP tools as well as built-in ones (pi's own documented
 //! behaviour), so a builder keeps our tools plus reading only: it has no `edit`, `write` or `bash`
@@ -22,11 +33,16 @@
 //! pi has no `--permission-prompt-tool`, so the same extension holds the bridge: its `tool_call`
 //! handler asks Craft Anything's own `core_action_approve` about every tool that changes something
 //! (pi's `bash`, `powershell`, `write`, `edit`) and blocks the call when the policy refuses or the
-//! person says no. Reads and our own tools pass straight through: ours carry their own consent.
-//! With that in place a Deep build may use pi's own editor and shell, as a Claude Code build does.
+//! person says no. The action's input goes in on stdin (a written file's content can be far past
+//! Windows' command-line limit), and the call has a deadline longer than the approval's own wait,
+//! after which the action is blocked. Reads and our own tools pass straight through: ours carry
+//! their own consent. With that in place a Deep build may use pi's own editor and shell, as a
+//! Claude Code build does.
 //!
-//! `sh`-style quoting is not involved anywhere: the extension is JSON, and the message never
-//! enters argv (Windows refuses long command lines, and its limit is far below a build's brief).
+//! A run over SSH is refused: the extension file is written on this computer, so a pi on the host
+//! would be handed a path it can't see. `sh`-style quoting is not involved anywhere: the extension
+//! is JSON, and the message never enters argv (Windows refuses long command lines, and its limit
+//! is far below a build's brief).
 
 use super::*;
 
@@ -48,6 +64,60 @@ const CHANGING_TOOLS: &[&str] = &["edit", "write", "bash", "powershell"];
 
 /// The extension's file name inside a run's folder.
 const EXTENSION_FILE: &str = "craft-anything-tools.js";
+
+/// Saved extra arguments that decide where a run's mode, tools, extensions or session come from.
+/// A saved `--tools` or `--extension` could re-open what this adapter holds shut (a Clean room
+/// build's file tools, another extension beside ours), so every run drops them and passes its own.
+/// #2118 proposed dropping such saved arguments; this is #1447's own list, applied to every run.
+const RESTRICTED: &[&str] = &[
+    "--mode",
+    "--session",
+    "--session-id",
+    "--fork",
+    "--session-dir",
+    "--no-session",
+    "--continue",
+    "--resume",
+    "--tools",
+    "--exclude-tools",
+    "--no-tools",
+    "--no-builtin-tools",
+    "--extension",
+    "--no-extensions",
+    "--no-mcp",
+    "--approve",
+    "--no-approve",
+    "--no-context-files",
+];
+
+/// The short forms of [`RESTRICTED`]. `-p`, `-c` and `-r` would start another kind of run.
+const RESTRICTED_SHORT: &[&str] = &["-p", "-c", "-r", "-t", "-xt", "-e", "-ne", "-nt", "-nbt", "-na", "-a"];
+
+/// [`RESTRICTED`] entries that take the next argument as their value.
+const RESTRICTED_VALUES: &[&str] =
+    &["--mode", "--session", "--session-id", "--fork", "--session-dir", "--tools", "--exclude-tools", "--extension", "-t", "-xt", "-e"];
+
+/// `extra` without the flags (and their values) that would override what this adapter decides.
+/// Everything after a bare `--` goes too: pi would read it as the message, not as options.
+fn strip_restricted_args(extra: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut rest = extra.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" {
+            break;
+        }
+        let name = arg.split('=').next().unwrap_or(arg);
+        if RESTRICTED.contains(&name) || RESTRICTED_SHORT.contains(&name) {
+            // A value given with `=` goes with its flag; one given after it is the next argument.
+            if !arg.contains('=') && RESTRICTED_VALUES.contains(&name) {
+                let _ = rest.next();
+            }
+            continue;
+        }
+        kept.push(arg.clone());
+    }
+    kept
+}
 
 /// The file a preflight writes and removes to prove the folder takes an extension.
 const PROBE_FILE: &str = "probe.js";
@@ -78,14 +148,41 @@ impl AgentAdapter for PiCli {
         true
     }
 
-    /// `--help` lists `--mode` and `--session-id`; without them the plain form would boot the
-    /// terminal UI in the middle of a build, so a failed check keeps this adapter.
+    /// A question starts a fresh session on purpose (no `--session-id`), so it is never answered
+    /// from a fork of the builder's conversation. #2118 proposed the hook; #1447's adapter answers
+    /// it, so a question's answer isn't labelled as the builder's.
+    fn questions_fork_session(&self) -> bool {
+        false
+    }
+
+    /// `--help` lists `--mode`, `--session-id` and the switches that keep other extensions and
+    /// project files out of a run; without them the plain form would boot the terminal UI in the
+    /// middle of a build, so a failed check keeps this adapter.
     fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
-        (&["--help"], &["--mode", "--session-id"])
+        (&["--help"], &["--mode", "--session-id", "--no-extensions", "--no-context-files", "--no-approve"])
+    }
+
+    /// The flags are older than every pi a build has been run with; one without them would load
+    /// the person's and the project's own extensions beside ours, so the run stops instead.
+    fn missing_flags_error(&self) -> Option<(&'static str, &'static str)> {
+        Some((
+            "This pi version doesn't have the switches a build needs to keep other extensions and project files out of it.",
+            "Update pi (`pi update`), then start the build again.",
+        ))
     }
 
     fn plain_fallback(&self) -> bool {
         false
+    }
+
+    /// A remote build would be handed a path on this computer: the extension file is written here,
+    /// and pi on the host would never see it. Refused plainly until the host gets its own server.
+    fn check_remote_options(&self, _options: &BackendOptions, _host: &str, _stop: &Stop) -> Result<(), ToolError> {
+        Err(ToolError::new(
+            ErrorCode::NotSupported,
+            "Pi can't build on another computer over SSH yet: its tool server and approval bridge are files this computer writes for the run.",
+        )
+        .with_remediation("Build on this computer, or choose an agent whose tool server is written on the host (OpenCode), and try again."))
     }
 
     fn check_tool_server(&self, stop: &CancelToken) -> Result<(), ToolError> {
@@ -108,18 +205,64 @@ impl AgentAdapter for PiCli {
         Some("Sign in the way pi does: run `pi` once in a terminal, sign in to the provider its default model uses, then start the build again.".into())
     }
 
+    /// pi keeps each session as `sessions/--<folder>--/<timestamp>_<id>.jsonl` under its own
+    /// folder, so a project can keep a copy that travels with it.
+    fn session_file(&self, id: &str) -> Option<std::path::PathBuf> {
+        agent_dir().and_then(|dir| session_file_in(&dir, id))
+    }
+
+    fn handoff(&self, saved: &str, max: usize) -> Option<String> {
+        pi_handoff(saved, max)
+    }
+
+    fn restore_session(&self, id: &str, saved: &[u8], cwd: &std::path::Path) -> Result<bool, ToolError> {
+        let dir = agent_dir().ok_or_else(|| ToolError::new(ErrorCode::BadSettings, "Couldn't find pi's folder on this computer."))?;
+        restore_session_in(&dir, id, saved, cwd)
+    }
+
+    /// The turn's own extension folder goes when the turn does, so a build leaves nothing in the
+    /// temporary folder.
+    fn clean_up_after_turn(&self, args: &[String]) {
+        for pair in args.windows(2) {
+            if pair[0] != "-e" {
+                continue;
+            }
+            let path = std::path::Path::new(&pair[1]);
+            if path.file_name().and_then(|n| n.to_str()) != Some(EXTENSION_FILE) {
+                continue;
+            }
+            let own = format!("craft-anything-pi-{}-", std::process::id());
+            let ours = path
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(&own))
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+            if ours && let Some(dir) = path.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
-        let mut a = cx.options.args.clone();
+        let mut a = strip_restricted_args(&cx.options.args);
         a.extend(["-p".into(), "--mode".into(), "json".into(), "--append-system-prompt".into(), cx.preamble.to_string()]);
         if let Some(model) = cx.options.cli_model.clone().filter(|m| !m.trim().is_empty()) {
             a.extend(["--model".into(), model]);
         }
         if let Some(effort) = cx.options.cli_thinking {
-            a.extend(["--thinking".into(), effort.as_str().into()]);
+            a.extend(["--thinking".into(), thinking_level(effort).into()]);
         }
+        // Nothing of the person's and nothing of the project's loads beside this run: no
+        // discovered extensions (a user's, or one a builder wrote into the project), no AGENTS.md
+        // or CLAUDE.md, and no trust-gated project files.
+        a.push("--no-extensions".into());
+        a.extend(["--no-context-files".into(), "--no-approve".into()]);
         if cx.question {
-            // A question only reads, and a fresh session leaves the builder's own conversation
-            // untouched: no `--session-id`, and no tool server.
+            // A question only reads, and a fresh, ephemeral session leaves the builder's own
+            // conversation and pi's session list untouched: no `--session-id`, no session file,
+            // and no server of anyone's connected.
+            a.extend(["--no-session".into(), "--no-mcp".into()]);
             if cx.reads_checked {
                 a.push("--no-tools".into());
             } else {
@@ -127,7 +270,10 @@ impl AgentAdapter for PiCli {
             }
             return a;
         }
-        a.extend(["-e".into(), extension_file(&builder_server(cx.mcp))]);
+        // `--no-extensions` turns off pi's built-in extensions too, its MCP support among them,
+        // so that one is loaded back by name: without it `registerMcpServer` fails and a build has
+        // no Craft Anything tools at all. Our server arrives only through the extension below.
+        a.extend(["-e".into(), "builtin:mcp".into(), "-e".into(), extension_file(&builder_server(cx.mcp))]);
         let mut tools: Vec<String> = Vec::new();
         // In Clean room the original may only be read through our tools, so no file tools of the
         // agent's own: the same rule its other adapters hold it to. In Deep mode a builder edits
@@ -203,6 +349,15 @@ impl AgentAdapter for PiCli {
     }
 }
 
+/// pi's own name for a thinking level: its lowest is `off`, where Craft Anything's is `none`.
+/// `--thinking none` is refused and falls back to pi's default instead of choosing the lowest.
+fn thinking_level(effort: crate::Effort) -> &'static str {
+    match effort {
+        crate::Effort::None => "off",
+        other => other.as_str(),
+    }
+}
+
 /// Add one assistant message's usage to the turn's totals. pi counts cached reads separately, and
 /// its `cost` is what an API at list prices would have charged, not what a plan was billed.
 fn account(p: &mut StreamParser, usage: &Value) {
@@ -226,19 +381,30 @@ fn failed(p: &mut StreamParser, why: &str) -> AgentEvent {
 /// The plain-words failure behind a provider's message, for the stop rules and the retry policy.
 fn classify(why: &str) -> FailureKind {
     let why = why.to_ascii_lowercase();
-    if why.contains("401") || why.contains("unauthor") || why.contains("api key") || why.contains("invalid key") || why.contains("not signed in") {
+    if has_code(&why, "401") || why.contains("unauthor") || why.contains("api key") || why.contains("invalid key") || why.contains("not signed in") {
         FailureKind::Authentication
-    } else if why.contains("402") || why.contains("quota") || why.contains("credit") || why.contains("billing") || why.contains("insufficient") {
+    } else if has_code(&why, "402") || why.contains("quota") || why.contains("credit") || why.contains("billing") || why.contains("insufficient") {
         FailureKind::Billing
-    } else if why.contains("429") || why.contains("rate limit") || why.contains("too many requests") {
+    } else if has_code(&why, "429") || why.contains("rate limit") || why.contains("too many requests") {
         FailureKind::RateLimited
     } else if why.contains("usage limit") || why.contains("plan limit") || why.contains("5-hour limit") || why.contains("weekly limit") {
         FailureKind::UsageLimit
-    } else if why.contains("timeout") || why.contains("timed out") || why.contains("overload") || why.contains("529") || why.contains("503") {
+    } else if has_code(&why, "529") || has_code(&why, "503") || why.contains("timeout") || why.contains("timed out") || why.contains("overload") {
         FailureKind::Transient
     } else {
         FailureKind::Unknown
     }
+}
+
+/// Whether `text` carries `code` as a status code, not as part of a longer number: a provider's
+/// error code `14018` contains `401`, and reading it as one would call a used-up plan a bad key.
+fn has_code(text: &str, code: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices(code).any(|(i, _)| {
+        let before = i.checked_sub(1).is_none_or(|j| !bytes[j].is_ascii_digit());
+        let after = bytes.get(i + code.len()).is_none_or(|b| !b.is_ascii_digit());
+        before && after
+    })
 }
 
 /// What to do about a failure, in the words a person can act on.
@@ -365,11 +531,32 @@ fn extension_js(mcp: &McpCommand) -> String {
     let approve = serde_json::Value::Array(approve_args(mcp).iter().map(|a| serde_json::Value::String(a.clone())).collect());
     format!(
         "// Craft Anything's tool server and approval bridge for this run. Generated; safe to delete.\n\
-         import {{ execFile }} from \"node:child_process\";\n\
-         import {{ promisify }} from \"node:util\";\n\
-         const craft = promisify(execFile);\n\
+         import {{ spawn }} from \"node:child_process\";\n\
          const CLI = {cli};\n\
          const APPROVE = {approve};\n\
+         // A tool's input can be a whole written file, so it goes in on stdin: a command line stops\n\
+         // at about 32,000 characters on Windows, which refused every large write. The wait is\n\
+         // longer than the approval's own 30 minutes, so only a stuck CLI reaches it; running out\n\
+         // blocks the action.\n\
+         const WAIT_MS = 35 * 60 * 1000;\n\
+         function ask(payload) {{\n  \
+           return new Promise((resolve, reject) => {{\n    \
+             const child = spawn(CLI, [...APPROVE, \"--json\", \"-\"], {{ stdio: [\"pipe\", \"pipe\", \"pipe\"], windowsHide: true }});\n    \
+             let out = \"\";\n    \
+             let err = \"\";\n    \
+             const timer = setTimeout(() => {{ child.kill(); reject(new Error(\"Craft Anything didn't answer within 35 minutes\")); }}, WAIT_MS);\n    \
+             child.stdout.on(\"data\", (d) => {{ out += d; }});\n    \
+             child.stderr.on(\"data\", (d) => {{ err += d; }});\n    \
+             child.on(\"error\", (e) => {{ clearTimeout(timer); reject(e); }});\n    \
+             child.on(\"close\", (code) => {{\n      \
+               clearTimeout(timer);\n      \
+               if (code === 0) resolve(out);\n      \
+               else reject(new Error(err.trim() || (\"exit code \" + code)));\n    \
+             }});\n    \
+             child.stdin.on(\"error\", () => {{}});\n    \
+             child.stdin.end(payload);\n  \
+           }});\n\
+         }}\n\
          // pi's own changing tools, in the shape Craft Anything's policy reads (Claude Code's).\n\
          const SHAPE = {{\n  \
            bash: (i) => [\"Bash\", {{ command: i.command }}],\n  \
@@ -388,7 +575,7 @@ fn extension_js(mcp: &McpCommand) -> String {
              const [tool, input] = shape(event.input ?? {{}});\n    \
              let verdict;\n    \
              try {{\n      \
-               const {{ stdout }} = await craft(CLI, [...APPROVE, \"--tool-name\", tool, \"--input\", JSON.stringify(input)], {{ maxBuffer: 1 << 20 }});\n      \
+               const stdout = await ask(JSON.stringify({{ tool_name: tool, input }}));\n      \
                verdict = JSON.parse(stdout)?.result;\n    \
              }} catch (e) {{\n      \
                return {{ block: true, reason: \"Craft Anything couldn't check this action, so it wasn't done: \" + (e?.message ?? e) }};\n    \
@@ -427,6 +614,16 @@ mod tests {
         args.get(i + 1).map(String::as_str).expect("a value after it")
     }
 
+    /// The extension file this run loads. `-e` also names pi's own built-in MCP support, which
+    /// `--no-extensions` turns off and this run has to load back.
+    fn extension_arg(args: &[String]) -> std::path::PathBuf {
+        args.windows(2)
+            .filter(|pair| pair[0] == "-e")
+            .map(|pair| std::path::PathBuf::from(&pair[1]))
+            .find(|path| path.file_name().and_then(|n| n.to_str()) == Some(EXTENSION_FILE))
+            .expect("the run loads its own extension")
+    }
+
     /// The message never enters argv, and the stream is the JSON one.
     #[test]
     fn the_message_stays_out_of_argv_and_the_stream_is_json() {
@@ -436,6 +633,7 @@ mod tests {
         assert!(PiCli.prompt_on_stdin(), "the message must go in on stdin");
         assert!(!a.iter().any(|arg| arg.contains("make a game")), "{a:?}");
         assert!(PiCli.streams_json());
+        PiCli.clean_up_after_turn(&a);
     }
 
     /// A resumed session continues the conversation; a question starts a fresh one, so it leaves
@@ -446,6 +644,7 @@ mod tests {
         assert_eq!(after(&a, "--session-id"), "s-1");
         let (q, _) = args(&BackendOptions::default(), false, true, false, Some("s-1"));
         assert!(!q.iter().any(|x| x == "--session-id"), "a question starts fresh: {q:?}");
+        PiCli.clean_up_after_turn(&a);
     }
 
     /// The model and thinking effort a person chose reach the CLI.
@@ -455,13 +654,114 @@ mod tests {
         let (a, _) = args(&options, true, false, false, None);
         assert_eq!(after(&a, "--model"), "magpie/foxcode/claude-sonnet-5-5");
         assert_eq!(after(&a, "--thinking"), "high");
+        PiCli.clean_up_after_turn(&a);
+    }
+
+    /// pi calls its lowest thinking level `off`: `--thinking none` is refused and falls back to
+    /// pi's own default, so the person's choice would be quietly ignored.
+    #[test]
+    fn the_lowest_thinking_level_is_called_off() {
+        let options = BackendOptions { cli_thinking: Some(Effort::None), ..Default::default() };
+        let (a, _) = args(&options, true, false, false, None);
+        assert_eq!(after(&a, "--thinking"), "off");
+        assert_eq!(thinking_level(Effort::Minimal), "minimal");
+        assert_eq!(thinking_level(Effort::Xhigh), "xhigh");
+        let folder = extension_arg(&a).parent().expect("a folder").to_path_buf();
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// Nothing of the person's or the project's loads beside this run: no discovered extensions,
+    /// no context files, no trust-gated project files — and pi's own MCP support is loaded back,
+    /// since `--no-extensions` turns it off too and `registerMcpServer` would fail without it.
+    #[test]
+    fn other_extensions_and_project_files_stay_out_of_a_run() {
+        let (a, _) = args(&BackendOptions::default(), true, false, false, None);
+        for flag in ["--no-extensions", "--no-context-files", "--no-approve"] {
+            assert!(a.iter().any(|x| x == flag), "{flag} is passed: {a:?}");
+        }
+        let loaded: Vec<&str> = a.windows(2).filter(|p| p[0] == "-e").map(|p| p[1].as_str()).collect();
+        assert_eq!(loaded.first(), Some(&"builtin:mcp"), "the built-in MCP support comes back: {a:?}");
+        assert!(loaded.iter().any(|p| p.ends_with(EXTENSION_FILE)), "and then ours: {a:?}");
+        let folder = extension_arg(&a).parent().expect("a folder").to_path_buf();
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// A question runs fresh and ephemerally, with no server of anyone's, so it leaves pi's
+    /// session list and the person's own servers alone.
+    #[test]
+    fn a_question_is_ephemeral_and_loads_no_server() {
+        let (q, _) = args(&BackendOptions::default(), false, true, false, None);
+        for flag in ["--no-session", "--no-mcp", "--no-extensions", "--no-context-files", "--no-approve"] {
+            assert!(q.iter().any(|x| x == flag), "{flag} is passed: {q:?}");
+        }
+        assert!(!q.iter().any(|x| x == "-e"), "no extension is loaded: {q:?}");
+        assert!(!PiCli.questions_fork_session(), "pi's question starts fresh, so it isn't the builder's");
+        assert!(PiCli.resumes(), "a build still continues its session");
+    }
+
+    /// A saved argument can't reopen what a run holds shut: no saved tools, extension, mode or
+    /// session, and nothing after a `--` (pi would read that as the message).
+    #[test]
+    fn saved_arguments_cannot_override_the_run() {
+        let options = BackendOptions {
+            args: vec![
+                "--tools".into(),
+                "read,bash".into(),
+                "--extension=x.js".into(),
+                "--session".into(),
+                "old".into(),
+                "--model".into(),
+                "kept".into(),
+                "--offline".into(),
+                "--".into(),
+                "not-a-message".into(),
+            ],
+            ..Default::default()
+        };
+        let (q, _) = args(&options, false, true, true, None);
+        for gone in ["--tools", "--extension", "--session", "read,bash", "x.js", "old", "--", "not-a-message"] {
+            assert!(!q.iter().any(|x| x == gone), "{gone} must not reach the run: {q:?}");
+        }
+        assert!(q.iter().any(|x| x == "--offline"), "other saved arguments stay: {q:?}");
+        assert!(q.iter().any(|x| x == "--model"), "a chosen model stays: {q:?}");
+        // The run's own limits are still the only ones.
+        assert!(q.iter().any(|x| x == "--no-tools"), "a Clean room question gets none: {q:?}");
+        assert!(q.iter().any(|x| x == "--no-extensions"), "{q:?}");
+    }
+
+    /// The run's extension folder is removed when the turn ends, and only a folder of our own.
+    #[test]
+    fn the_runs_extension_folder_is_removed_after_the_turn() {
+        let (a, _) = args(&BackendOptions::default(), true, false, false, None);
+        let folder = extension_arg(&a).parent().expect("a folder").to_path_buf();
+        assert!(folder.exists(), "the run's folder is there while it runs");
+        PiCli.clean_up_after_turn(&a);
+        assert!(!folder.exists(), "and gone when the turn is over: {folder:?}");
+        // A folder not named by us is left alone, whatever an argument says.
+        let keep = temp_dir("not-ours");
+        let file = keep.join(EXTENSION_FILE);
+        std::fs::write(&file, "// x").expect("a file");
+        PiCli.clean_up_after_turn(&["-e".into(), file.display().to_string()]);
+        assert!(keep.exists(), "a folder we didn't make stays: {keep:?}");
+        let _ = std::fs::remove_dir_all(&keep);
+    }
+
+    /// A remote build would be handed a path on this computer, so it is refused in words a person
+    /// can act on instead of starting a pi that can't see its tools.
+    #[test]
+    fn a_build_over_ssh_is_refused() {
+        let stop = crate::model::Stop::for_tool(Default::default());
+        let err = PiCli.check_remote_options(&BackendOptions::default(), "example.invalid", &stop).expect_err("refused");
+        assert_eq!(err.code, ErrorCode::NotSupported);
+        assert!(err.message.contains("SSH"), "{}", err.message);
+        assert!(err.remediation.as_deref().unwrap_or_default().contains("this computer"), "{err:?}");
     }
 
     /// The run's own tool server, as an extension in a folder only its owner can read.
     #[test]
     fn the_tool_server_arrives_as_an_extension_in_the_runs_own_folder() {
         let (a, mcp) = args(&BackendOptions::default(), true, false, false, None);
-        let path = std::path::PathBuf::from(after(&a, "-e"));
+        let path = extension_arg(&a);
         assert!(path.exists(), "{path:?}");
         let written = std::fs::read_to_string(&path).expect("read the extension");
         assert!(written.contains("registerMcpServer"), "{written}");
@@ -482,7 +782,7 @@ mod tests {
         }
         // Two runs never share one.
         let (b, _) = args(&BackendOptions::default(), true, false, false, None);
-        let other = std::path::PathBuf::from(after(&b, "-e")).parent().expect("a folder").to_path_buf();
+        let other = extension_arg(&b).parent().expect("a folder").to_path_buf();
         assert_ne!(folder, other);
         for dir in [folder, other] {
             let _ = std::fs::remove_dir_all(dir);
@@ -502,6 +802,7 @@ mod tests {
             assert!(tools.contains(kept), "{kept} belongs to a Deep builder: {tools:?}");
         }
         assert!(tools.iter().any(|t| t.starts_with(TOOL_PREFIX)), "our tools: {tools:?}");
+        PiCli.clean_up_after_turn(&a);
     }
 
     /// Every changing tool pi offers goes through Craft Anything's own approval first, from the
@@ -509,7 +810,7 @@ mod tests {
     #[test]
     fn the_extension_holds_the_approval_bridge() {
         let (a, mcp) = args(&BackendOptions::default(), true, false, false, None);
-        let path = std::path::PathBuf::from(after(&a, "-e"));
+        let path = extension_arg(&a);
         let written = std::fs::read_to_string(&path).expect("read the extension");
         for shape in ["bash:", "powershell:", "write:", "edit:"] {
             assert!(written.contains(shape), "{shape} is gated: {written}");
@@ -517,6 +818,15 @@ mod tests {
         assert!(written.contains("pi.on(\"tool_call\""), "{written}");
         assert!(written.contains("\"core-action-approve\""), "{written}");
         assert!(written.contains(&format!("\"{}\"", mcp.args[2])), "the run's project is passed: {written}");
+        // A written file's content can be far past Windows' command-line limit, so the action's
+        // input goes in on stdin; the call has a deadline past the approval's own wait, and
+        // running out blocks the action.
+        assert!(written.contains("\"--json\", \"-\""), "the input goes in on stdin: {written}");
+        assert!(!written.contains("--tool-name") && !written.contains("--input"), "nothing of the action is in argv: {written}");
+        assert!(written.contains("const WAIT_MS = 35 * 60 * 1000;"), "a deadline past the 30-minute wait: {written}");
+        assert!(written.contains("child.kill()") && written.contains("block: true"), "running out blocks it: {written}");
+        assert!(!written.contains("execFile"), "spawn replaces the size-capped call: {written}");
+        assert!(written.contains("child.stdin.end(payload)"), "the payload is written: {written}");
         let bridge = written.lines().find(|l| l.trim_start().starts_with("const APPROVE")).expect("the approval command");
         assert!(bridge.contains("\"core-action-approve\""), "{bridge}");
         assert!(!bridge.contains("--all-tools") && !bridge.contains("--inbox"), "only the approval tool's own options: {bridge}");
@@ -529,7 +839,7 @@ mod tests {
     #[test]
     fn a_builders_server_lists_every_tool() {
         let (a, _) = args(&BackendOptions::default(), true, false, false, None);
-        let path = std::path::PathBuf::from(after(&a, "-e"));
+        let path = extension_arg(&a);
         let written = std::fs::read_to_string(&path).expect("read the extension");
         assert!(written.contains("--all-tools"), "{written}");
         let folder = path.parent().expect("a folder").to_path_buf();
@@ -548,6 +858,7 @@ mod tests {
         let (q, _) = args(&BackendOptions::default(), false, true, true, None);
         assert!(q.iter().any(|x| x == "--no-tools"), "a Clean room question gets no tools: {q:?}");
         assert!(!q.iter().any(|x| x == "-e"), "and no tool server: {q:?}");
+        PiCli.clean_up_after_turn(&a);
     }
 
     /// A Deep-mode question reads with the agent's own tools and never has our server.
@@ -562,7 +873,7 @@ mod tests {
     #[test]
     fn registered_not_the_plain_adapter() {
         assert!(AgentAdapters::built_in().for_agent("pi").ids().contains(&"pi"));
-        assert_eq!(PiCli.required_flags(), (&["--help"][..], &["--mode", "--session-id"][..]));
+        assert_eq!(PiCli.required_flags(), (&["--help"][..], &["--mode", "--session-id", "--no-extensions", "--no-context-files", "--no-approve"][..]));
         assert!(!PiCli.plain_fallback(), "the plain form would boot the terminal UI");
     }
 
@@ -616,6 +927,8 @@ mod tests {
         assert_eq!(p.failure.map(|f| f.kind), Some(FailureKind::Authentication));
         for (why, kind) in [
             ("429 Too Many Requests", FailureKind::RateLimited),
+            ("429: {\"type\":\"insufficient_quota\",\"code\":14018}", FailureKind::Billing),
+            ("HTTP 14018 is not a status", FailureKind::Unknown),
             ("Claude usage limit reached. It resets at 3pm", FailureKind::UsageLimit),
             ("insufficient credit", FailureKind::Billing),
             ("upstream timed out", FailureKind::Transient),
