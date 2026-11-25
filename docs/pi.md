@@ -27,6 +27,17 @@ enabled = true
 `cli_model`, as with the other agent apps (`craft-anything-cli ai model "Pi" <model>`); the
 thinking depth goes in through `--thinking` when one is chosen.
 
+## Models and thinking
+
+Settings → AI lists pi's own models, asked of pi itself. `pi --mode rpc` answers
+`get_available_models` with each model's `thinkingLevelMap`, so the picker offers exactly the
+depths that model takes; a pi that doesn't answer falls back to `pi --offline --list-models`,
+whose table only says whether a model reasons (so the depths it offers stop at `high`). Both are
+asked with `--no-extensions`, because every run turns extensions off: a model an extension
+supplied could not be used by a build anyway. A chosen model and depth are checked against that
+same list before each run, so a model pi no longer offers, or a depth it doesn't take, stops with
+a plain fix instead of being passed on and refused mid-build.
+
 ## What a run does
 
 - One message per turn: `pi -p --mode json` with the message on stdin (never in argv, so a long
@@ -53,6 +64,22 @@ thinking depth goes in through `--thinking` when one is chosen.
   the message). Other saved arguments, such as `--model` or `--offline`, are kept.
 - A run over SSH is refused before it starts: the extension file is written on this computer, so a
   pi on the host would be handed a path it can't see. It says so in plain words instead.
+
+## Sessions that travel with the project
+
+pi keeps each conversation as `sessions/--<folder>--/<timestamp>_<id>.jsonl` under its own folder
+(`PI_CODING_AGENT_DIR`, else `~/.pi/agent`). The project keeps a copy of it (`agent-session.jsonl`,
+written after every turn), and a project moved to another computer puts it back in the folder pi
+looks in for that project's working folder, named after the conversation's own timestamp, so the
+same conversation carries on (#451). A folder reached through a link — `/tmp` is `/private/tmp` on
+macOS — is resolved first, because pi names the real folder; without that the copy lands beside it
+and pi starts a second conversation under the same id. When the copy is of another session, or
+nothing can be put back, the id is dropped and the next turn starts from the brief, what is in
+`app/`, and the newest exchanges kept in the copy (`handoff`). A resumed id pi still can't find is
+started again as a fresh conversation under that same id, with only a warning on stderr; that
+warning is reported to the person, and the id is kept, because pi's new conversation has it and
+clearing it would start yet another one. A question is answered from the files anyway, so it is
+never presented as the builder's own conversation.
 
 ## The tool server
 
@@ -134,8 +161,10 @@ described above and is deleted with it. A run that cannot write that file stops 
 - The approval bridge, in a Deep build: five `bash` calls and two `write` calls ran after the policy
   allowed them (`cargo --version` reached the page's footer as its exact output), and one action the
   policy refused ("Run a scripted web session") was blocked and reported to the builder.
-- Not verified: a Clean room build end to end (its tool list is unit-tested only), a model chosen
-  in Settings, and pi versions other than 1.5.0 and 1.6.0.
+- Not verified: a Clean room build end to end (its tool list is unit-tested only), a live build
+  with a model and depth chosen in Settings (both are read from pi and checked), a sign-in
+  pre-check (`pi auth check` needs a provider or a model the adapter isn't given), and pi versions
+  other than 1.5.0 and 1.6.0.
 - Checked on pi 1.6.0 (2026-11-25, macOS): the generated extension loads and its tool is declared
   (`mcp__craft_anything_run__*`), `--no-extensions -e builtin:mcp` keeps the person's and the
   project's extensions and `AGENTS.md` out while our server still connects, `--tools` with an
@@ -143,6 +172,7 @@ described above and is deleted with it. A run that cannot write that file stops 
   folder, and `-p` reads the message from stdin. The approval call took a 300,000-character input on
   stdin, refused a malformed payload, and its deadline blocked a CLI that never answered. A
   provider's error code `14018` is read as the used-up plan it is, not as a `401` bad key (a
-  status code counts only as its own number).
+  status code counts only as its own number). `ai model "Pi"` listed pi's 57 configured models,
+  each with its own depths (`xhigh`/`max` only where mapped, none for a model that doesn't reason).
 - A first live run on 1.5.0 left a folder in the temporary folder after every turn; the run's
   folder is now removed when the turn ends.

@@ -1247,8 +1247,10 @@ Owner: open · Status: in progress
       and a Deep build was run live)
 - [ ] Pi over SSH: refused today, because the extension is written on this computer; a remote
       builder needs our tool server written on the host, as OpenCode's does
-- [ ] Pi's model list in Settings (its `--list-models` prints a table) and a sign-in check
-      (`pi auth check` needs a provider or model the adapter isn't given)
+- [x] Pi's model list in Settings: `get_available_models` over `--mode rpc` gives each model's
+      thinking depths, with `--list-models` as the fallback; a chosen model and depth are checked
+      per run (`validate_model_for_access`). Live: 57 models read from pi 1.6.0.
+- [ ] Pi's sign-in check (`pi auth check` needs a provider or model the adapter isn't given)
 - [x] Grok Build as a coding agent over ACP (`grok agent stdio`): discovery in `~/.grok/bin`,
       the person's own `grok login` (a missing `auth.json` is unknown, so an API key still
       starts), model and reasoning effort, and our MCP server on the session with `"type": "stdio"`

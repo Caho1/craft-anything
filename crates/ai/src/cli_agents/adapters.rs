@@ -82,6 +82,19 @@ pub trait AgentAdapter: Send + Sync {
     fn validate_model(&self, _config: &BackendConfig, _options: &BackendOptions, _directory: Option<&Path>, _stop: &Stop) -> Result<(), ToolError> {
         Ok(())
     }
+    /// Check a saved choice for the access mode the run will have. An agent whose catalogue
+    /// depends on that mode (an extension's providers are off in a restricted run) overrides it;
+    /// otherwise it is [`validate_model`](AgentAdapter::validate_model).
+    fn validate_model_for_access(
+        &self,
+        config: &BackendConfig,
+        options: &BackendOptions,
+        directory: Option<&Path>,
+        _access: Access,
+        stop: &Stop,
+    ) -> Result<(), ToolError> {
+        self.validate_model(config, options, directory, stop)
+    }
     /// Refuse options that the native transport cannot support, before preflight or process I/O.
     /// Saving a model choice and discovering its catalogue do not imply native execution support.
     /// `cwd` is the folder the agent will run in on this computer.

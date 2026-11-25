@@ -47,6 +47,7 @@
 use super::*;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// The name our extension registers the server under. Not `craft-anything`, which a person's own
 /// `mcp.json` entry may use: pi refuses two clients with one name, and a `mcp.json` entry would
@@ -199,6 +200,62 @@ impl AgentAdapter for PiCli {
         Some(options.and_then(|o| o.cli_model.clone()).filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "pi's own default".into()))
     }
 
+    /// pi lists its own models, with the thinking depths each one actually exposes.
+    fn has_model_catalog(&self) -> bool {
+        true
+    }
+
+    /// The models a run can use, asked of pi itself: `--mode rpc` answers `get_available_models`
+    /// with each model's thinking levels, and `--offline --list-models` is the fallback for a pi
+    /// whose RPC answer didn't come. Both are asked with `--no-extensions`, because every run
+    /// turns extensions off: a model an extension supplied could not be used by a build.
+    fn model_catalog(
+        &self,
+        config: &BackendConfig,
+        options: &BackendOptions,
+        directory: Option<&Path>,
+        stop: &Stop,
+    ) -> Result<Vec<models::AgentModel>, ToolError> {
+        stop.check()?;
+        if config.ssh_host.as_deref().is_some_and(|h| !h.trim().is_empty()) {
+            return Err(ToolError::new(
+                ErrorCode::NotSupported,
+                "Pi's models can't be listed on another computer over SSH yet: a run there is refused for the same reason.",
+            )
+            .with_remediation("Choose Pi on this computer, or remove the SSH host from this AI and try again."));
+        }
+        let program = program_of(config, options)?;
+        let extra = strip_restricted_args(&options.args);
+        let mut rpc = vec!["--mode".to_string(), "rpc".into(), "--no-session".into(), "--offline".into(), "--no-extensions".into()];
+        rpc.extend(extra.iter().cloned());
+        if let Ok(out) = query(&program, &rpc, Some(MODELS_REQUEST), directory, stop)
+            && out.success
+            && let Some(list) = parse_rpc_models(&out.stdout)?
+        {
+            return Ok(list);
+        }
+        let mut list = vec!["--offline".to_string(), "--list-models".into(), "--no-extensions".into()];
+        list.extend(extra);
+        let out = query(&program, &list, None, directory, stop)?;
+        if !out.success {
+            let name = Path::new(&program).file_name().map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
+            return Err(craft_anything_platform::process::nonzero_error_with(&name, &out, None));
+        }
+        parse_list_models(&out.stdout)
+    }
+
+    /// The chosen model and thinking depth must be ones pi offers this run: a saved choice that
+    /// pi no longer has (or a depth it doesn't expose) stops with a plain fix instead of being
+    /// passed on and refused mid-build.
+    fn validate_model(&self, config: &BackendConfig, options: &BackendOptions, directory: Option<&Path>, stop: &Stop) -> Result<(), ToolError> {
+        stop.check()?;
+        self.check_native_options(options, directory)?;
+        if options.cli_model.is_none() && options.cli_thinking.is_none() {
+            return Ok(());
+        }
+        models::validate(options, &self.model_catalog(config, options, directory, stop)?)
+    }
+
     /// Sign-in belongs to the provider pi was set up with, and checking it needs a provider or a
     /// model name the adapter isn't given. The run itself reports what the provider refused.
     fn sign_in_fix(&self) -> Option<String> {
@@ -289,6 +346,21 @@ impl AgentAdapter for PiCli {
             a.extend(["--session-id".into(), resume.to_string()]);
         }
         a
+    }
+
+    /// A resumed conversation whose file pi can't find is started again under the same id, with
+    /// only a warning on stderr. Unlike an agent that stops, pi answers, and the id it was given
+    /// is now the project's conversation: it must be kept (clearing it would start yet another
+    /// session on the next turn), and the person is told the earlier one wasn't here.
+    fn parse_stderr(&self, _p: &mut StreamParser, line: &str) -> Vec<AgentEvent> {
+        let lower = line.to_ascii_lowercase();
+        let lost = lower.contains("no project session found with id") || lower.contains("no session found matching");
+        if lost {
+            return vec![AgentEvent::Status {
+                text: "The builder's earlier conversation isn't on this computer, so pi started a new one under the project's session id.".into(),
+            }];
+        }
+        Vec::new()
     }
 
     /// Each JSON line: the session header's id, text deltas, tool calls and their results, the
@@ -421,6 +493,141 @@ fn remediation(kind: FailureKind) -> &'static str {
             "Run `pi` once in this project's folder to see the same answer without Craft Anything, then start the build again."
         }
     }
+}
+
+/// pi's RPC command that answers with every configured model and the thinking levels each
+/// actually exposes (`thinkingLevelMap`).
+const MODELS_REQUEST: &str = "{\"type\":\"get_available_models\"}\n";
+
+/// Most bytes of a model list this adapter reads.
+const MODELS_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Longest a model-catalogue query may take.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Run one of pi's own queries (its model catalogue), with a deadline, drained output and the
+/// run's stop.
+fn query(
+    program: &str,
+    args: &[String],
+    stdin: Option<&str>,
+    directory: Option<&std::path::Path>,
+    stop: &Stop,
+) -> Result<craft_anything_platform::Output, ToolError> {
+    let mut proc = PiCli.process(program).args(args.to_vec());
+    if let Some(dir) = directory {
+        proc = proc.cwd(dir);
+    }
+    if let Some(input) = stdin {
+        proc = proc.stdin_bytes(input);
+    }
+    let stop = stop.clone();
+    proc.timeout(QUERY_TIMEOUT)
+        .idle_timeout(Duration::from_secs(10))
+        .stdout_cap(MODELS_MAX_BYTES)
+        .stderr_cap(64 * 1024)
+        .cancel_when(move || stop.is_stopped())
+        .remediation("Check Pi on this computer (`pi --list-models`), then reload the models.")
+        .run()
+}
+
+/// The `get_available_models` answer, as the shared model picker's entries. `None` when the
+/// answer's line isn't there, so the caller can ask the table instead.
+pub(crate) fn parse_rpc_models(bytes: &[u8]) -> Result<Option<Vec<models::AgentModel>>, ToolError> {
+    if bytes.len() >= MODELS_MAX_BYTES {
+        return Err(ToolError::new(ErrorCode::OverLimit, "Pi's model list is too large."));
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let Some(response) = text.lines().find_map(|line| {
+        let v: Value = serde_json::from_str(line.trim()).ok()?;
+        (v.get("type").and_then(Value::as_str) == Some("response") && v.get("command").and_then(Value::as_str) == Some("get_available_models")).then_some(v)
+    }) else {
+        return Ok(None);
+    };
+    if response.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err(ToolError::new(ErrorCode::GarbledOutput, "Pi couldn't list its models.")
+            .with_remediation("Check Pi on this computer (`pi --list-models`), then reload the models."));
+    }
+    let Some(items) = response.pointer("/data/models").and_then(Value::as_array) else {
+        return Err(ToolError::new(ErrorCode::GarbledOutput, "Pi returned an unreadable model list."));
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "chat") {
+            continue;
+        }
+        let Some(provider) = item.get("provider").and_then(Value::as_str).filter(|s| !s.is_empty()) else { continue };
+        let Some(model) = item.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) else { continue };
+        let label = item.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(model);
+        let reasoning = item.get("reasoning").and_then(Value::as_bool).unwrap_or(false);
+        let map = item.get("thinkingLevelMap").and_then(Value::as_object);
+        let id = format!("{provider}/{model}");
+        let thinking = supported_thinking(reasoning, map);
+        out.insert(id.clone(), models::AgentModel { id, name: format!("{label} ({provider})"), thinking });
+    }
+    Ok(Some(out.into_values().collect()))
+}
+
+/// The table `--list-models` prints: a header of six columns, then one row per model. Rows that
+/// aren't a model (sign-in guidance, a broken line) are skipped, so a pi with no models reads as
+/// an empty list rather than an error.
+pub(crate) fn parse_list_models(bytes: &[u8]) -> Result<Vec<models::AgentModel>, ToolError> {
+    if bytes.len() >= MODELS_MAX_BYTES {
+        return Err(ToolError::new(ErrorCode::OverLimit, "Pi's model list is too large."));
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = std::collections::BTreeMap::new();
+    let mut header = false;
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if !header {
+            let is_header = cols.len() == 6
+                && cols[0].eq_ignore_ascii_case("provider")
+                && cols[1].eq_ignore_ascii_case("model")
+                && cols[2].eq_ignore_ascii_case("context")
+                && cols[3].eq_ignore_ascii_case("max-out")
+                && cols[4].eq_ignore_ascii_case("thinking")
+                && cols[5].eq_ignore_ascii_case("images");
+            if is_header {
+                header = true;
+            }
+            continue;
+        }
+        let [provider, model, _context, _max_out, thinking, images] = cols.as_slice() else { continue };
+        if provider.is_empty() || model.is_empty() || !is_yes_no(thinking) || !is_yes_no(images) {
+            continue;
+        }
+        let id = format!("{provider}/{model}");
+        // The table says only yes or no: without `thinkingLevelMap`, `xhigh` and `max` can't be
+        // confirmed for a model, so the base depths up to `high` are what it is offered.
+        let thinking = if thinking.eq_ignore_ascii_case("yes") {
+            vec![crate::Effort::None, crate::Effort::Minimal, crate::Effort::Low, crate::Effort::Medium, crate::Effort::High]
+        } else {
+            Vec::new()
+        };
+        out.insert(id.clone(), models::AgentModel { id, name: format!("{model} ({provider})"), thinking });
+    }
+    Ok(out.into_values().collect())
+}
+
+/// The thinking depths a model exposes, from pi's `reasoning` flag and `thinkingLevelMap`: a null
+/// entry is a depth the model doesn't take, and `xhigh`/`max` are only there when it does.
+fn supported_thinking(reasoning: bool, map: Option<&serde_json::Map<String, Value>>) -> Vec<crate::Effort> {
+    if !reasoning {
+        return Vec::new();
+    }
+    crate::Effort::CLI_ALL
+        .into_iter()
+        .filter(|&effort| match map.and_then(|m| m.get(thinking_level(effort))) {
+            Some(Value::Null) => false,
+            None if matches!(effort, crate::Effort::Xhigh | crate::Effort::Max) => false,
+            _ => true,
+        })
+        .collect()
+}
+
+fn is_yes_no(text: &str) -> bool {
+    text.eq_ignore_ascii_case("yes") || text.eq_ignore_ascii_case("no")
 }
 
 /// The text of a tool result: pi's blocks, joined.
@@ -936,6 +1143,189 @@ mod tests {
         ] {
             assert_eq!(classify(why), kind, "{why}");
         }
+    }
+
+    /// pi answers the model query over RPC with each model's thinking levels; a null level is one
+    /// it doesn't take, and `xhigh`/`max` are only there when it does.
+    #[test]
+    fn the_model_catalogue_reads_pis_rpc_answer() {
+        let answer = serde_json::json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
+            {"id":"deepseek-flash","name":"DeepSeek V4.1 Flash","provider":"deepseek","reasoning":true,
+             "thinkingLevelMap":{"minimal":null,"low":"low","medium":null,"high":"high","max":"max"}},
+            {"id":"plain","name":"Plain","provider":"p","reasoning":false},
+            {"id":"picture","provider":"p","type":"image"}
+        ]}});
+        let list = parse_rpc_models(format!("{answer}\n").as_bytes()).expect("read").expect("an answer");
+        let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["deepseek/deepseek-flash", "p/plain"], "{list:?}");
+        assert_eq!(list[0].name, "DeepSeek V4.1 Flash (deepseek)");
+        assert_eq!(list[0].thinking, [Effort::None, Effort::Low, Effort::High, Effort::Max], "only the levels it maps");
+        assert!(list[1].thinking.is_empty(), "a model without reasoning has none");
+        // No answer line: the caller asks the table instead.
+        assert!(parse_rpc_models(b"Warning: no models are signed in\n").expect("read").is_none());
+    }
+
+    /// The table a pi without that answer prints: six columns, one row per model, and anything
+    /// else (sign-in guidance, a broken line) skipped.
+    #[test]
+    fn the_model_catalogue_reads_pis_table() {
+        let table = "No models are signed in yet. Run `pi` to sign in.\n\
+provider      model            context  max-out  thinking  images\n\
+deepseek      deepseek-flash   1M       384K     yes       no\n\
+p             plain            128K     8K       no        yes\n\
+broken        row\n\
+magpie        agy-cli/x        250K     64K      yes       yes\n";
+        let list = parse_list_models(table.as_bytes()).expect("read");
+        let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["deepseek/deepseek-flash", "magpie/agy-cli/x", "p/plain"], "{list:?}");
+        assert_eq!(list[0].name, "deepseek-flash (deepseek)");
+        assert_eq!(list[0].thinking, [Effort::None, Effort::Minimal, Effort::Low, Effort::Medium, Effort::High]);
+        assert!(list[2].thinking.is_empty(), "no reasoning, no depths");
+        assert!(parse_list_models(b"nothing here\n").expect("read").is_empty());
+    }
+
+    /// The catalogue a run would have: a stand-in pi answers the RPC query, and one that doesn't
+    /// falls back to the table. A chosen model and depth are checked against it.
+    #[test]
+    fn a_chosen_model_and_depth_are_checked_against_the_runs_catalogue() {
+        let dir = temp_dir("catalogue");
+        let answer = serde_json::json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
+            {"id":"m","name":"M","provider":"p","reasoning":true,"thinkingLevelMap":{"minimal":null,"low":"low","medium":null,"high":"high"}}
+        ]}});
+        let script = dir.join("pi");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" --mode rpc \"*) cat >/dev/null; printf '%s\\n' '{answer}'; ;;\n  *\" --list-models \"*) printf '%s\\n' 'provider model context max-out thinking images' 'p table 1M 1K yes no'; ;;\nesac\n"
+            ),
+        )
+        .expect("a stand-in");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        let config = BackendConfig { name: "Pi".into(), kind: crate::BackendKind::AgentCli, model: "pi".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions { command: Some(script.display().to_string()), ..Default::default() };
+        let list = PiCli.model_catalog(&config, &options, None, &Stop::default()).expect("a catalogue");
+        assert_eq!(list.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["p/m"], "{list:?}");
+        assert_eq!(list[0].thinking, [Effort::None, Effort::Low, Effort::High], "the null levels and the absent xhigh/max");
+
+        let chosen = BackendOptions { cli_model: Some("p/m".into()), cli_thinking: Some(Effort::High), ..options.clone() };
+        assert!(PiCli.validate_model(&config, &chosen, None, &Stop::default()).is_ok());
+        let too_deep = BackendOptions { cli_thinking: Some(Effort::Medium), ..chosen.clone() };
+        let err = PiCli.validate_model(&config, &too_deep, None, &Stop::default()).expect_err("medium isn't mapped");
+        assert!(err.message.contains("p/m"), "{}", err.message);
+        let gone = BackendOptions { cli_model: Some("p/nope".into()), cli_thinking: None, ..options.clone() };
+        assert!(PiCli.validate_model(&config, &gone, None, &Stop::default()).is_err(), "a model it doesn't have");
+
+        // A pi that can't answer over RPC still lists its models in the table.
+        let quiet = dir.join("quiet-pi");
+        std::fs::write(&quiet, "#!/bin/sh\ncase \" $* \" in\n  *\" --list-models \"*) printf '%s\\n' 'provider model context max-out thinking images' 'p table 1M 1K yes no'; ;;\nesac\n").expect("a stand-in");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755));
+        }
+        let quiet_options = BackendOptions { command: Some(quiet.display().to_string()), ..Default::default() };
+        let list = PiCli.model_catalog(&config, &quiet_options, None, &Stop::default()).expect("the table");
+        assert_eq!(list.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["p/table"], "{list:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resumed conversation pi can't find is started again under the same id: the person is
+    /// told, and the id is kept (pi's new conversation has it, so clearing it would start another).
+    #[test]
+    fn a_lost_session_is_reported_and_its_id_kept() {
+        let mut p = StreamParser::new(Arc::new(PiCli));
+        let events = PiCli.parse_stderr(&mut p, "Warning: No project session found with id 'abc'; creating a new session with that id.");
+        assert!(matches!(events.as_slice(), [AgentEvent::Status { text }] if text.contains("started a new one")), "{events:?}");
+        assert!(!p.session_missing, "pi's new session has the id it was given, so it isn't forgotten");
+        let mut fresh = StreamParser::new(Arc::new(PiCli));
+        assert!(PiCli.parse_stderr(&mut fresh, "some other warning").is_empty());
+        assert!(!fresh.session_missing);
+    }
+
+    /// A folder of a test's own, so a run never writes over another's.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("craft-anything-pi-test-{}-{}-{name}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).expect("a test folder");
+        dir
+    }
+
+    /// The kept copy of a session, as the project would hold it.
+    fn kept(id: &str) -> String {
+        format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-11-09T07:55:11.094Z\",\"cwd\":\"/w/P\"}}\n\
+             {{\"type\":\"message\",\"id\":\"a\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"build a clock\"}}]}}}}\n\
+             {{\"type\":\"message\",\"id\":\"b\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Writing app/index.html\"}},{{\"type\":\"toolCall\",\"id\":\"c\",\"name\":\"build_file_write\",\"arguments\":{{}}}}]}}}}\n"
+        )
+    }
+
+    /// pi names a working folder between two `--`, with its separators read as `-`.
+    #[test]
+    fn a_working_folder_is_named_the_way_pi_names_it() {
+        assert_eq!(session_folder(std::path::Path::new("/private/tmp/p")), "--private-tmp-p--");
+        assert_eq!(session_folder(std::path::Path::new(r"C:\w\p")), "--C--w-p--");
+    }
+
+    /// A project carried to another computer gets its builder's conversation back, in the folder
+    /// pi looks for it in; a copy of another session is refused.
+    #[test]
+    fn a_session_travels_with_the_project() {
+        let dir = temp_dir("session");
+        let id = "01a1bf4d-d376-7776-9210-8cdc5ee15094";
+        let cwd = std::path::Path::new("/w/P");
+        assert!(session_file_in(&dir, id).is_none(), "nothing here yet");
+        assert!(restore_session_in(&dir, id, kept(id).as_bytes(), cwd).expect("put back"), "it was put back");
+        let path = session_file_in(&dir, id).expect("found by id");
+        assert!(path.ends_with(format!("2026-11-09T07-55-11-094Z_{id}.jsonl")), "{path:?}");
+        assert_eq!(path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()), Some("--w-P--"), "{path:?}");
+        assert!(!restore_session_in(&dir, id, kept(id).as_bytes(), cwd).expect("already here"), "a second copy is nothing to do");
+        // A copy of another session is refused where the session isn't here: nothing is written
+        // under this one's name.
+        let empty = temp_dir("wrong-session");
+        let other = kept("11111111-2222-3333-4444-555555555555");
+        assert!(restore_session_in(&empty, id, other.as_bytes(), cwd).is_err(), "another session's file is refused");
+        assert!(session_file_in(&empty, id).is_none(), "and nothing was put there");
+        let _ = std::fs::remove_dir_all(&empty);
+        // An id pi would not use names no session.
+        assert!(session_file_in(&dir, "../../etc/passwd").is_none());
+        assert!(restore_session_in(&dir, "a/b", kept(id).as_bytes(), cwd).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The copy lands in the folder pi really uses: a linked path (`/tmp` on macOS) is resolved.
+    #[test]
+    fn a_copy_lands_in_the_real_folder_pi_uses() {
+        let dir = temp_dir("canonical");
+        let cwd = dir.join("project");
+        std::fs::create_dir_all(&cwd).expect("a working folder");
+        let id = "01a1bf4d-d376-7776-9210-8cdc5ee15094";
+        assert!(restore_session_in(&dir, id, kept(id).as_bytes(), &cwd).expect("put back"));
+        let real = std::fs::canonicalize(&cwd).expect("the real path");
+        let path = session_file_in(&dir, id).expect("found by id");
+        let folder = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
+        assert_eq!(folder, Some(session_folder(&real).as_str()), "{path:?}");
+        // A second run writing under the same id is the one a copy keeps.
+        let newer = path.with_file_name(format!("2099-01-01T00-00-00-000Z_{id}.jsonl"));
+        std::fs::write(&newer, kept(id)).expect("a newer file");
+        assert_eq!(session_file_in(&dir, id).as_deref(), Some(newer.as_path()), "the newest file wins");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a new conversation is told of the earlier one: the newest exchanges, clipped.
+    #[test]
+    fn a_handoff_keeps_the_newest_exchange_and_leaves_out_tool_calls() {
+        let text = pi_handoff(&kept("x"), 16_000).expect("something to tell");
+        assert!(text.contains("Craft Anything asked you: build a clock"), "{text}");
+        assert!(text.contains("You answered: Writing app/index.html"), "{text}");
+        assert!(!text.contains("build_file_write"), "a tool call is not an answer: {text}");
+        assert!(pi_handoff("", 16_000).is_none());
+        // Only the newest entry fits when the room is small.
+        let narrow = pi_handoff(&kept("x"), 40).expect("one entry");
+        assert_eq!(narrow, "You answered: Writing app/index.html", "{narrow}");
     }
 
     /// A server, a tool or a flag with a quote in it must not break the extension's JavaScript.
