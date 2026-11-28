@@ -626,16 +626,6 @@ fn private_dir() -> std::fs::DirBuilder {
     std::fs::DirBuilder::new()
 }
 
-/// What one turn's arguments wrote for it, removed when the turn is over however it ends. Holds
-/// the adapter, because only an adapter knows which of its arguments name a file it made.
-struct TurnFiles(Arc<dyn AgentAdapter>, Vec<String>);
-
-impl Drop for TurnFiles {
-    fn drop(&mut self) {
-        self.0.clean_up_after_turn(&self.1);
-    }
-}
-
 /// What a run may do with files: a question reads only, a builder builds, anything else analyses;
 /// Deep mode or not decides whether the original is in reach (#564).
 fn access_for(builder: bool, deep: bool, question: bool) -> Access {
@@ -1350,10 +1340,6 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         message_file.as_ref().map(|f| f.0.as_path()),
         run_dir.as_ref().map(|d| d.0.as_path()),
     );
-    let args = args_for(adapter.as_ref(), &spec.options, text, &preamble, &mcp, resume_arg, access, message_file.as_ref().map(|f| f.0.as_path()));
-    // Whatever the arguments wrote for this turn (an extension file, for one) goes when the turn
-    // does, including a turn that is stopped, times out or fails before its process starts.
-    let _turn_files = TurnFiles(adapter.clone(), args.clone());
     let shown = FailureContext::new(&program, &args, text, remote.as_deref(), spec);
     // A builder turn may take hours and sit silent for long stretches: Ghidra's first look at a big
     // game, an engine build, or the person answering a question. Claude Code's own limits are

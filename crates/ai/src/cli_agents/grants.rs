@@ -159,7 +159,7 @@ pub fn table(adapters: &AgentAdapters) -> Vec<(&'static str, Grants)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli_agents::{APPROVAL_TOOL, Access, ArgsCx, MCP_NAME, McpCommand};
+    use crate::cli_agents::{APPROVAL_TOOL, Access, ArgsCx, MCP_NAME, McpCommand, RunDir};
     use crate::config::BackendOptions;
     use std::path::Path as StdPath;
 
@@ -169,9 +169,10 @@ mod tests {
 
     /// What a builder run of `adapter` hands the process: its arguments, and the environment
     /// variable that names our server when it goes that way.
-    fn builder_run(adapter: &dyn AgentAdapter) -> (Vec<String>, Option<String>) {
+    fn builder_run(adapter: &dyn AgentAdapter) -> (Vec<String>, Option<String>, Option<RunDir>) {
         let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: Some(StdPath::new("notes").to_path_buf()) };
         let options = BackendOptions::default();
+        let run = adapter.run_files().then(RunDir::make).flatten();
         let cx = ArgsCx {
             options: &options,
             prompt: "make a game",
@@ -182,9 +183,9 @@ mod tests {
             reads_checked: false,
             question: false,
             message_file: None,
-            run_dir: None,
+            run_dir: run.as_ref().map(|d| d.0.as_path()),
         };
-        (adapter.args(&cx), adapter.mcp_env(&mcp, Access::Build).ok().flatten().map(|(k, v)| format!("{k}={v}")))
+        (adapter.args(&cx), adapter.mcp_env(&mcp, Access::Build).ok().flatten().map(|(k, v)| format!("{k}={v}")), run)
     }
 
     /// Whether the run carries someone else's program to reach our server: in an argument (Claude
@@ -219,7 +220,7 @@ mod tests {
     fn a_tool_server_is_declared_exactly_when_a_run_carries_one() {
         for a in adapters() {
             let row = row_of(a.as_ref());
-            let (argv, env) = builder_run(a.as_ref());
+            let (argv, env, _run) = builder_run(a.as_ref());
             match row.path {
                 Path::Argv => {
                     let carried = carries_server(&argv, env.as_deref(), "craft-anything-cli");
@@ -240,8 +241,6 @@ mod tests {
                     assert_eq!(row.mid_turn_notes, Given::No, "{}: no ACP run takes a note mid-turn", row.id);
                 }
             }
-            // Whatever the run wrote for this turn (pi's extension folder) goes as a turn's does.
-            a.clean_up_after_turn(&argv);
         }
     }
 
@@ -257,7 +256,7 @@ mod tests {
         for a in adapters() {
             let row = row_of(a.as_ref());
             let g = grants(a.as_ref());
-            let (argv, _) = builder_run(a.as_ref());
+            let (argv, _, _run) = builder_run(a.as_ref());
             let notes = argv.iter().any(|w| w.contains("builder-notes"));
             assert_eq!(
                 g.mid_turn_notes.given(),
@@ -271,7 +270,6 @@ mod tests {
                 let asks = names_approval(&argv) || row.path == Path::Acp;
                 assert!(asks, "{}: an approval channel is declared, but its run has none", row.id);
             }
-            a.clean_up_after_turn(&argv);
         }
     }
 

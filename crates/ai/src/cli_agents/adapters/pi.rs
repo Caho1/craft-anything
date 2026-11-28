@@ -277,28 +277,9 @@ impl AgentAdapter for PiCli {
         restore_session_in(&dir, id, saved, cwd)
     }
 
-    /// The turn's own extension folder goes when the turn does, so a build leaves nothing in the
-    /// temporary folder.
-    fn clean_up_after_turn(&self, args: &[String]) {
-        for pair in args.windows(2) {
-            if pair[0] != "-e" {
-                continue;
-            }
-            let path = std::path::Path::new(&pair[1]);
-            if path.file_name().and_then(|n| n.to_str()) != Some(EXTENSION_FILE) {
-                continue;
-            }
-            let own = format!("craft-anything-pi-{}-", std::process::id());
-            let ours = path
-                .parent()
-                .and_then(|d| d.file_name())
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix(&own))
-                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
-            if ours && let Some(dir) = path.parent() {
-                let _ = std::fs::remove_dir_all(dir);
-            }
-        }
+    /// The runner owns this turn's private extension folder and removes it when the turn ends.
+    fn run_files(&self) -> bool {
+        true
     }
 
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
@@ -330,7 +311,7 @@ impl AgentAdapter for PiCli {
         // `--no-extensions` turns off pi's built-in extensions too, its MCP support among them,
         // so that one is loaded back by name: without it `registerMcpServer` fails and a build has
         // no Craft Anything tools at all. Our server arrives only through the extension below.
-        a.extend(["-e".into(), "builtin:mcp".into(), "-e".into(), extension_file(&builder_server(cx.mcp))]);
+        a.extend(["-e".into(), "builtin:mcp".into(), "-e".into(), extension_file(cx.run_dir, &builder_server(cx.mcp))]);
         let mut tools: Vec<String> = Vec::new();
         // In Clean room the original may only be read through our tools, so no file tools of the
         // agent's own: the same rule its other adapters hold it to. In Deep mode a builder edits
@@ -651,11 +632,153 @@ fn builder_server(mcp: &McpCommand) -> McpCommand {
     server
 }
 
+/// pi's own folder: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`. A folder chosen for the backend in
+/// Settings is not applied: pi reads that variable itself, and a second place to look would put
+/// sessions where pi does not.
+fn agent_dir() -> Option<std::path::PathBuf> {
+    match std::env::var_os("PI_CODING_AGENT_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => Some(std::path::PathBuf::from(dir)),
+        None => dirs::home_dir().map(|home| home.join(".pi").join("agent")),
+    }
+}
+
+/// An id pi would use: a UUID, or whatever `--session-id` was given. Anything else (a hand-edited
+/// project file) names no session.
+fn session_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// The folder pi gives a working folder: the leading separator removed and `/`, `\` and `:` read
+/// as `-`, between two `--` (`/w/P` is `--w-P--`, as pi's own session files are named).
+fn session_folder(cwd: &std::path::Path) -> String {
+    let text = cwd.to_string_lossy();
+    let text = text.strip_prefix('/').unwrap_or(&text);
+    format!("--{}--", text.replace(['/', '\\', ':'], "-"))
+}
+
+/// Folders under pi's `sessions/` looked through for one session, so a big history stays bounded.
+const SESSION_FOLDERS: usize = 10_000;
+
+/// The file pi keeps session `id` in under `dir`, if this computer has it: the newest one, since a
+/// run that didn't find a put-back copy starts a second file under the same id.
+fn session_file_in(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
+    if !session_id_ok(id) {
+        return None;
+    }
+    let suffix = format!("_{id}.jsonl");
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for folder in std::fs::read_dir(dir.join("sessions")).ok()?.flatten().take(SESSION_FOLDERS) {
+        let Ok(files) = std::fs::read_dir(folder.path()) else { continue };
+        for path in files.flatten().map(|f| f.path()) {
+            let named = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix));
+            if !named || !path.is_file() {
+                continue;
+            }
+            let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else { continue };
+            if newest.as_ref().is_none_or(|(at, _)| modified > *at) {
+                newest = Some((modified, path));
+            }
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// Where a kept copy put back for `cwd` belongs: pi's folder for that working folder, named after
+/// the session's own timestamp so pi reads it as one of its own.
+fn kept_session_path(dir: &std::path::Path, id: &str, stamp: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+    dir.join("sessions").join(session_folder(cwd)).join(format!("{stamp}_{id}.jsonl"))
+}
+
+/// A stamp for a kept session that names no timestamp of its own.
+const KEPT_STAMP: &str = "1970-01-01T00-00-00-000Z";
+
+/// Put a kept copy of session `id` back where pi looks for it in `cwd`. `Ok(false)`: it's here
+/// already. A copy of another session is refused rather than restored.
+fn restore_session_in(dir: &std::path::Path, id: &str, saved: &[u8], cwd: &std::path::Path) -> Result<bool, ToolError> {
+    if !session_id_ok(id) {
+        return Err(ToolError::invalid("The project names its builder's session with an id pi doesn't use."));
+    }
+    if session_file_in(dir, id).is_some() {
+        return Ok(false);
+    }
+    let header = saved.split(|b| *b == b'\n').next().and_then(|line| serde_json::from_slice::<Value>(line).ok());
+    let Some(header) = header.filter(|h| h.get("id").and_then(Value::as_str) == Some(id)) else {
+        return Err(ToolError::invalid("The conversation kept in the project is of another session."));
+    };
+    let stamp = header
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(|t| t.replace([':', '.'], "-"))
+        .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == 'T'))
+        .unwrap_or_else(|| KEPT_STAMP.to_string());
+    // `/tmp` is a link to `/private/tmp` on macOS, and `/var` to `/private/var`: pi's own working
+    // folder is the real one, so the copy has to land there or the run won't find it.
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let path = kept_session_path(dir, id, &stamp, &cwd);
+    craft_anything_platform::fs::write_atomic_private(&path, saved)?;
+    Ok(true)
+}
+
+/// What a new session needs to know of an earlier one: the newest exchanges in the kept copy of a
+/// session, each clipped, keeping at most `max` characters. pi's entries are a tree (`id`/
+/// `parentId`); the newest are the tail of the file, which is the branch that was last written.
+fn pi_handoff(saved: &str, max: usize) -> Option<String> {
+    let clip = |text: &str| {
+        let text = text.trim();
+        if text.chars().count() > HANDOFF_ENTRY { format!("{}…", text.chars().take(HANDOFF_ENTRY).collect::<String>()) } else { text.to_string() }
+    };
+    let texts = |content: Option<&Value>| -> String {
+        content
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut entries = Vec::new();
+    for v in saved.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        if v.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(message) = v.get("message") else { continue };
+        let content = message.get("content");
+        match message.get("role").and_then(Value::as_str) {
+            Some("user") => {
+                let text = content.and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| texts(content));
+                if !text.trim().is_empty() {
+                    entries.push(format!("Craft Anything asked you: {}", clip(&text)));
+                }
+            }
+            Some("assistant") => {
+                let text = texts(content);
+                if !text.trim().is_empty() {
+                    entries.push(format!("You answered: {}", clip(&text)));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for entry in entries.iter().rev() {
+        let n = entry.chars().count().saturating_add(2);
+        if used.saturating_add(n) > max {
+            break;
+        }
+        used = used.saturating_add(n);
+        kept.push(entry.as_str());
+    }
+    kept.reverse();
+    (!kept.is_empty()).then(|| kept.join("\n\n"))
+}
+
 /// The extension file this run loads, or a path that isn't there when the folder can't take one,
 /// so the run fails at startup instead of building without the tool server it was promised
 /// ([`check_tool_server`](AgentAdapter::check_tool_server) reports the everyday causes first).
-fn extension_file(mcp: &McpCommand) -> String {
-    let Ok(dir) = extension_dir() else { return missing_extension() };
+fn extension_file(dir: Option<&std::path::Path>, mcp: &McpCommand) -> String {
+    let Some(dir) = dir else { return missing_extension() };
     let path = dir.join(EXTENSION_FILE);
     match craft_anything_platform::write_atomic_private(&path, extension_js(mcp).as_bytes()) {
         Ok(()) => path.display().to_string(),
@@ -808,11 +931,25 @@ mod tests {
         }
     }
 
-    /// The arguments for one message.
-    fn args(options: &BackendOptions, builder: bool, question: bool, reads_checked: bool, resume: Option<&str>) -> (Vec<String>, McpCommand) {
+    /// The arguments for one message in the runner-provided folder.
+    fn args_in(
+        options: &BackendOptions,
+        builder: bool,
+        question: bool,
+        reads_checked: bool,
+        resume: Option<&str>,
+        run_dir: Option<&Path>,
+    ) -> (Vec<String>, McpCommand) {
         let mcp = mcp();
-        let cx = ArgsCx { options, prompt: "make a game", preamble: "PRE ", mcp: &mcp, resume, builder, reads_checked, question, message_file: None, run_dir: None };
+        let cx = ArgsCx { options, prompt: "make a game", preamble: "PRE ", mcp: &mcp, resume, builder, reads_checked, question, message_file: None, run_dir };
         (PiCli.args(&cx), mcp.clone())
+    }
+
+    /// A real run-directory guard, held by the test until the run would be over.
+    fn args(options: &BackendOptions, builder: bool, question: bool, reads_checked: bool, resume: Option<&str>) -> (Vec<String>, McpCommand, RunDir) {
+        let run = RunDir::make().expect("a run folder");
+        let (args, mcp) = args_in(options, builder, question, reads_checked, resume, Some(&run.0));
+        (args, mcp, run)
     }
 
     /// The value after `flag`.
@@ -834,34 +971,31 @@ mod tests {
     /// The message never enters argv, and the stream is the JSON one.
     #[test]
     fn the_message_stays_out_of_argv_and_the_stream_is_json() {
-        let (a, _) = args(&BackendOptions::default(), true, false, false, None);
+        let (a, _, _run) = args(&BackendOptions::default(), true, false, false, None);
         assert_eq!(a[0..4], ["-p", "--mode", "json", "--append-system-prompt"], "{a:?}");
         assert_eq!(after(&a, "--append-system-prompt"), "PRE ");
         assert!(PiCli.prompt_on_stdin(), "the message must go in on stdin");
         assert!(!a.iter().any(|arg| arg.contains("make a game")), "{a:?}");
         assert!(PiCli.streams_json());
-        PiCli.clean_up_after_turn(&a);
     }
 
     /// A resumed session continues the conversation; a question starts a fresh one, so it leaves
     /// the builder's conversation as it was.
     #[test]
     fn a_resumed_build_continues_the_session_and_a_question_does_not() {
-        let (a, _) = args(&BackendOptions::default(), true, false, false, Some("s-1"));
+        let (a, _, _run) = args(&BackendOptions::default(), true, false, false, Some("s-1"));
         assert_eq!(after(&a, "--session-id"), "s-1");
-        let (q, _) = args(&BackendOptions::default(), false, true, false, Some("s-1"));
+        let (q, _, _run) = args(&BackendOptions::default(), false, true, false, Some("s-1"));
         assert!(!q.iter().any(|x| x == "--session-id"), "a question starts fresh: {q:?}");
-        PiCli.clean_up_after_turn(&a);
     }
 
     /// The model and thinking effort a person chose reach the CLI.
     #[test]
     fn a_chosen_model_and_effort_reach_the_cli() {
         let options = BackendOptions { cli_model: Some("magpie/foxcode/claude-sonnet-5-5".into()), cli_thinking: Some(Effort::High), ..Default::default() };
-        let (a, _) = args(&options, true, false, false, None);
+        let (a, _, _run) = args(&options, true, false, false, None);
         assert_eq!(after(&a, "--model"), "magpie/foxcode/claude-sonnet-5-5");
         assert_eq!(after(&a, "--thinking"), "high");
-        PiCli.clean_up_after_turn(&a);
     }
 
     /// pi calls its lowest thinking level `off`: `--thinking none` is refused and falls back to
@@ -869,7 +1003,7 @@ mod tests {
     #[test]
     fn the_lowest_thinking_level_is_called_off() {
         let options = BackendOptions { cli_thinking: Some(Effort::None), ..Default::default() };
-        let (a, _) = args(&options, true, false, false, None);
+        let (a, _, _run) = args(&options, true, false, false, None);
         assert_eq!(after(&a, "--thinking"), "off");
         assert_eq!(thinking_level(Effort::Minimal), "minimal");
         assert_eq!(thinking_level(Effort::Xhigh), "xhigh");
@@ -882,7 +1016,7 @@ mod tests {
     /// since `--no-extensions` turns it off too and `registerMcpServer` would fail without it.
     #[test]
     fn other_extensions_and_project_files_stay_out_of_a_run() {
-        let (a, _) = args(&BackendOptions::default(), true, false, false, None);
+        let (a, _, _run) = args(&BackendOptions::default(), true, false, false, None);
         for flag in ["--no-extensions", "--no-context-files", "--no-approve"] {
             assert!(a.iter().any(|x| x == flag), "{flag} is passed: {a:?}");
         }
@@ -897,7 +1031,7 @@ mod tests {
     /// session list and the person's own servers alone.
     #[test]
     fn a_question_is_ephemeral_and_loads_no_server() {
-        let (q, _) = args(&BackendOptions::default(), false, true, false, None);
+        let (q, _, _run) = args(&BackendOptions::default(), false, true, false, None);
         for flag in ["--no-session", "--no-mcp", "--no-extensions", "--no-context-files", "--no-approve"] {
             assert!(q.iter().any(|x| x == flag), "{flag} is passed: {q:?}");
         }
@@ -925,7 +1059,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (q, _) = args(&options, false, true, true, None);
+        let (q, _, _run) = args(&options, false, true, true, None);
         for gone in ["--tools", "--extension", "--session", "read,bash", "x.js", "old", "--", "not-a-message"] {
             assert!(!q.iter().any(|x| x == gone), "{gone} must not reach the run: {q:?}");
         }
@@ -936,21 +1070,15 @@ mod tests {
         assert!(q.iter().any(|x| x == "--no-extensions"), "{q:?}");
     }
 
-    /// The run's extension folder is removed when the turn ends, and only a folder of our own.
+    /// Dropping the runner's guard removes the extension folder, however the turn ended.
     #[test]
     fn the_runs_extension_folder_is_removed_after_the_turn() {
-        let (a, _) = args(&BackendOptions::default(), true, false, false, None);
+        let (a, _, run) = args(&BackendOptions::default(), true, false, false, None);
         let folder = extension_arg(&a).parent().expect("a folder").to_path_buf();
+        assert_eq!(folder, run.0, "the extension lives in the runner's folder");
         assert!(folder.exists(), "the run's folder is there while it runs");
-        PiCli.clean_up_after_turn(&a);
+        drop(run);
         assert!(!folder.exists(), "and gone when the turn is over: {folder:?}");
-        // A folder not named by us is left alone, whatever an argument says.
-        let keep = temp_dir("not-ours");
-        let file = keep.join(EXTENSION_FILE);
-        std::fs::write(&file, "// x").expect("a file");
-        PiCli.clean_up_after_turn(&["-e".into(), file.display().to_string()]);
-        assert!(keep.exists(), "a folder we didn't make stays: {keep:?}");
-        let _ = std::fs::remove_dir_all(&keep);
     }
 
     /// A remote build would be handed a path on this computer, so it is refused in words a person
@@ -967,7 +1095,7 @@ mod tests {
     /// The run's own tool server, as an extension in a folder only its owner can read.
     #[test]
     fn the_tool_server_arrives_as_an_extension_in_the_runs_own_folder() {
-        let (a, mcp) = args(&BackendOptions::default(), true, false, false, None);
+        let (a, mcp, _run) = args(&BackendOptions::default(), true, false, false, None);
         let path = extension_arg(&a);
         assert!(path.exists(), "{path:?}");
         let written = std::fs::read_to_string(&path).expect("read the extension");
@@ -978,7 +1106,7 @@ mod tests {
         assert!(written.contains("--project"), "the run's own arguments: {written}");
         // A folder of the run's own, so nothing another user prepared is loaded through it.
         let folder = path.parent().expect("a folder of its own").to_path_buf();
-        let own = format!("craft-anything-pi-{}-", std::process::id());
+        let own = format!("craft-anything-run-{}-", std::process::id());
         assert!(folder.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&own)), "{folder:?}");
         #[cfg(unix)]
         {
@@ -988,7 +1116,7 @@ mod tests {
             assert_eq!(bits(&path), 0o600, "extension {:o}", bits(&path));
         }
         // Two runs never share one.
-        let (b, _) = args(&BackendOptions::default(), true, false, false, None);
+        let (b, _, _run) = args(&BackendOptions::default(), true, false, false, None);
         let other = extension_arg(&b).parent().expect("a folder").to_path_buf();
         assert_ne!(folder, other);
         for dir in [folder, other] {
@@ -1000,7 +1128,7 @@ mod tests {
     /// out because it could call another server's tools by name.
     #[test]
     fn a_deep_builder_may_edit_and_run_but_not_reach_other_servers() {
-        let (a, _) = args(&BackendOptions::default(), true, false, false, None);
+        let (a, _, _run) = args(&BackendOptions::default(), true, false, false, None);
         let tools: Vec<&str> = after(&a, "--tools").split(',').collect();
         for own in ["codemode", "tool_search"] {
             assert!(!tools.contains(&own), "{own} must not be there: {tools:?}");
@@ -1009,14 +1137,13 @@ mod tests {
             assert!(tools.contains(kept), "{kept} belongs to a Deep builder: {tools:?}");
         }
         assert!(tools.iter().any(|t| t.starts_with(TOOL_PREFIX)), "our tools: {tools:?}");
-        PiCli.clean_up_after_turn(&a);
     }
 
     /// Every changing tool pi offers goes through Craft Anything's own approval first, from the
     /// same generated file, so nothing outside the repository is installed into pi.
     #[test]
     fn the_extension_holds_the_approval_bridge() {
-        let (a, mcp) = args(&BackendOptions::default(), true, false, false, None);
+        let (a, mcp, _run) = args(&BackendOptions::default(), true, false, false, None);
         let path = extension_arg(&a);
         let written = std::fs::read_to_string(&path).expect("read the extension");
         for shape in ["bash:", "powershell:", "write:", "edit:"] {
@@ -1045,7 +1172,7 @@ mod tests {
     /// A builder has no editor of its own, so its tool server lists the build tools.
     #[test]
     fn a_builders_server_lists_every_tool() {
-        let (a, _) = args(&BackendOptions::default(), true, false, false, None);
+        let (a, _, _run) = args(&BackendOptions::default(), true, false, false, None);
         let path = extension_arg(&a);
         let written = std::fs::read_to_string(&path).expect("read the extension");
         assert!(written.contains("--all-tools"), "{written}");
@@ -1060,18 +1187,17 @@ mod tests {
     /// In Clean room nothing of the original is read through the agent's own file tools.
     #[test]
     fn a_clean_room_builder_gets_no_file_tools() {
-        let (a, _) = args(&BackendOptions::default(), true, false, true, None);
+        let (a, _, _run) = args(&BackendOptions::default(), true, false, true, None);
         assert_eq!(after(&a, "--tools"), format!("{TOOL_PREFIX}*"));
-        let (q, _) = args(&BackendOptions::default(), false, true, true, None);
+        let (q, _, _run) = args(&BackendOptions::default(), false, true, true, None);
         assert!(q.iter().any(|x| x == "--no-tools"), "a Clean room question gets no tools: {q:?}");
         assert!(!q.iter().any(|x| x == "-e"), "and no tool server: {q:?}");
-        PiCli.clean_up_after_turn(&a);
     }
 
     /// A Deep-mode question reads with the agent's own tools and never has our server.
     #[test]
     fn a_question_reads_with_the_agents_own_tools() {
-        let (q, _) = args(&BackendOptions::default(), false, true, false, None);
+        let (q, _, _run) = args(&BackendOptions::default(), false, true, false, None);
         assert_eq!(after(&q, "--tools"), READ_TOOLS.join(","));
         assert!(!q.iter().any(|x| x == "-e"), "{q:?}");
     }
@@ -1082,6 +1208,7 @@ mod tests {
         assert!(AgentAdapters::built_in().for_agent("pi").ids().contains(&"pi"));
         assert_eq!(PiCli.required_flags(), (&["--help"][..], &["--mode", "--session-id", "--no-extensions", "--no-context-files", "--no-approve"][..]));
         assert!(!PiCli.plain_fallback(), "the plain form would boot the terminal UI");
+        assert!(PiCli.run_files(), "the runner provides and removes the extension folder");
     }
 
     /// A folder that can't take the extension leaves a path that isn't there, rather than a build
@@ -1090,6 +1217,15 @@ mod tests {
     fn a_folder_that_cannot_take_the_extension_leaves_a_path_that_is_not_there() {
         let missing = missing_extension();
         assert!(!std::path::Path::new(&missing).exists(), "{missing}");
+    }
+
+    /// If the runner cannot provide a folder, no extension is written elsewhere and left behind.
+    #[test]
+    fn without_a_run_folder_no_extension_is_written() {
+        let (a, _) = args_in(&BackendOptions::default(), true, false, false, None, None);
+        let path = a.windows(2).filter(|pair| pair[0] == "-e").map(|pair| std::path::PathBuf::from(&pair[1])).next_back().expect("the missing extension path");
+        assert_eq!(path, std::path::PathBuf::from(missing_extension()));
+        assert!(!path.exists(), "nothing was written outside the run: {path:?}");
     }
 
     /// pi's JSON lines: the session id, the text, both ends of a tool call, and the usage.

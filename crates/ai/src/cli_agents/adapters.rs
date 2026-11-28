@@ -248,10 +248,6 @@ pub trait AgentAdapter: Send + Sync {
     fn process(&self, program: &str) -> Process {
         Process::new(program)
     }
-    /// Remove what [`args`](AgentAdapter::args) wrote for one turn (an extension file, for one),
-    /// once the turn's process is over, however it ended: finished, stopped, timed out or failed
-    /// before it started. Called for every run whose arguments were built.
-    fn clean_up_after_turn(&self, _args: &[String]) {}
     /// Whether it still names an account it was signed in to, so a sign-in that doesn't work any
     /// more has expired (or was signed out) rather than never happened.
     fn signed_in_before(&self) -> bool {
